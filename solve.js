@@ -420,20 +420,31 @@ function findSingleStar(s, from) {
 
 const WS_RE = /\s/;
 
-function escOne(c) {
+// The Markdown renderer writes its HTML already JSON-escaped (the body of a JSON string literal): every character it
+// emits is either HTML-escaped text, structure it writes itself ("\n" as \n, attribute quotes as \"), or a control
+// character / backslash / lone surrogate escaped as JSON.stringify would. Reading it back with JSON.parse gives
+// exactly the HTML makefun-site renders.
+
+/** One character as escaped HTML, then JSON-escaped. */
+function escOneJ(c) {
   switch (c) {
     case 38: return '&amp;';
     case 60: return '&lt;';
     case 62: return '&gt;';
     case 34: return '&quot;';
     case 39: return '&#39;';
-    default: return String.fromCharCode(c);
+    case 92: return '\\\\';
+    default:
+      return c < 32 ? JSON.stringify(String.fromCharCode(c)).slice(1, -1) : String.fromCharCode(c);
   }
 }
 
+/** Characters that end a plain run in inline(): the Markdown marks, the HTML escapes, backslash and controls. */
 const SPECIAL = new Uint8Array(128);
 for (const c of [92, 96, 42, 91, 38, 60, 62, 34, 39]) SPECIAL[c] = 1;
+for (let c = 0; c < 32; c++) SPECIAL[c] = 1;
 
+/** `s` rendered inline, JSON-escaped. */
 function inline(s, env) {
   let out = '';
   let i = 0;
@@ -442,7 +453,9 @@ function inline(s, env) {
     let j = i;
     while (j < n) {
       const c = s.charCodeAt(j);
-      if (c < 128 && SPECIAL[c] === 1) break;
+      if (c < 128) {
+        if (SPECIAL[c] === 1) break;
+      } else if (c >= 0xd800 && c <= 0xdfff) break;
       j++;
     }
     if (j > i) {
@@ -451,18 +464,28 @@ function inline(s, env) {
       if (i >= n) break;
     }
     const c = s.charCodeAt(i);
-    if (c === 92) {
-      if (i + 1 < n && isEscapable(s.charCodeAt(i + 1))) {
-        out += escOne(s.charCodeAt(i + 1));
+    if (c >= 0xd800) {
+      // a surrogate: a pair goes out as it is, a lone one escaped
+      const d = s.charCodeAt(i + 1);
+      if (c <= 0xdbff && d >= 0xdc00 && d <= 0xdfff) {
+        out += s.slice(i, i + 2);
         i += 2;
       } else {
-        out += '\\';
+        out += JSON.stringify(s[i]).slice(1, -1);
+        i++;
+      }
+    } else if (c === 92) {
+      if (i + 1 < n && isEscapable(s.charCodeAt(i + 1))) {
+        out += escOneJ(s.charCodeAt(i + 1));
+        i += 2;
+      } else {
+        out += '\\\\';
         i++;
       }
     } else if (c === 96) {
       const k = s.indexOf('`', i + 1);
       if (k > i + 1) {
-        out += '<code>' + escapeHtml(s.slice(i + 1, k)) + '</code>';
+        out += '<code>' + escHJ(s.slice(i + 1, k)) + '</code>';
         i = k + 1;
       } else {
         out += '`';
@@ -493,20 +516,21 @@ function inline(s, env) {
       const m = k !== -1 && s.charCodeAt(k + 1) === 40 ? s.indexOf(')', k + 2) : -1;
       const target = m === -1 ? '' : s.slice(k + 2, m);
       if (target !== '' && !WS_RE.test(target)) {
-        out += '<a href="' + escapeHtml(env.link(target)) + '">' + inline(s.slice(i + 1, k), env) + '</a>';
+        out += '<a href=\\"' + escHJ(env.link(target)) + '\\">' + inline(s.slice(i + 1, k), env) + '</a>';
         i = m + 1;
       } else {
         out += '[';
         i++;
       }
     } else {
-      out += escOne(c);
+      out += escOneJ(c);
       i++;
     }
   }
   return out;
 }
 
+/** `src` rendered: { html, toc: [{ level, id, html }], excerpt }, every html JSON-escaped. */
 function renderMarkdown(src, env) {
   const ids = new Set();
   let html = '';
@@ -517,39 +541,45 @@ function renderMarkdown(src, env) {
       case 'heading': {
         const id = uniqueSlug(slugify(t.text), ids);
         const h = inline(t.text, env);
-        html += `<h${t.depth} id="${id}">${h}</h${t.depth}>\n`;
+        html += '<h' + t.depth + ' id=\\"' + id + '\\">' + h + '</h' + t.depth + '>\\n';
         if (t.depth === 2 || t.depth === 3) toc.push({ level: t.depth, id, html: h });
         break;
       }
       case 'code': {
         let body = '';
-        for (const l of t.lines) body += escapeHtml(l) + '\n';
-        html += (t.lang === '' ? '<pre><code>' : `<pre><code class="language-${escapeHtml(t.lang)}">`) + body + '</code></pre>\n';
+        for (const l of t.lines) body += escHJ(l) + '\\n';
+        html += (t.lang === '' ? '<pre><code>' : '<pre><code class=\\"language-' + escHJ(t.lang) + '\\">') + body + '</code></pre>\\n';
         break;
       }
       case 'hr':
-        html += '<hr>\n';
+        html += '<hr>\\n';
         break;
       case 'blockquote':
-        html += t.lines.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(t.lines.join('\n'), env)}</p>\n</blockquote>\n`;
+        html += t.lines.length === 0 ? '<blockquote>\\n</blockquote>\\n' : '<blockquote>\\n<p>' + inline(t.lines.join('\n'), env) + '</p>\\n</blockquote>\\n';
         break;
       case 'list': {
         const tag = t.ordered ? 'ol' : 'ul';
-        let s = t.ordered && t.start !== 1 ? `<ol start="${t.start}">\n` : `<${tag}>\n`;
-        for (const item of t.items) s += `<li>${inline(item, env)}</li>\n`;
-        html += s + `</${tag}>\n`;
+        let s = t.ordered && t.start !== 1 ? '<ol start=\\"' + t.start + '\\">\\n' : '<' + tag + '>\\n';
+        for (const item of t.items) s += '<li>' + inline(item, env) + '</li>\\n';
+        html += s + '</' + tag + '>\\n';
         break;
       }
       case 'paragraph': {
         const h = inline(t.text, env);
         if (excerpt === null) excerpt = h;
-        html += `<p>${h}</p>\n`;
+        html += '<p>' + h + '</p>\\n';
         break;
       }
     }
   }
   return { html, toc, excerpt: excerpt ?? '' };
 }
+
+/** A JSON-escaped string's text. */
+const unJ = (j) => JSON.parse('"' + j + '"');
+
+/** The symbol under which a record keeps the JSON-escaped form of its HTML fields (no template can name it). */
+const JSYM = Symbol('json');
 
 // ------------------------------------------------------------------ templates
 
@@ -839,7 +869,20 @@ function compileTemplates(parsed) {
       }
       case 'raw': {
         const p = n.path;
-        return (sc) => jsonEsc(textOf(lookupPath(sc, p)));
+        if (p.length === 1) {
+          const p0 = p[0];
+          return (sc) => jsonEsc(textOf(lookupName(sc, p0)));
+        }
+        // A record that keeps the JSON-escaped form of a field (JSYM) hands it over as it is.
+        const parentPath = p.slice(0, -1);
+        const key = p[p.length - 1];
+        return (sc) => {
+          const o = lookupPath(sc, parentPath);
+          if (o === null || typeof o !== 'object' || !Object.hasOwn(o, key)) return '';
+          const jm = o[JSYM];
+          if (jm !== undefined && Object.hasOwn(jm, key)) return jm[key];
+          return jsonEsc(textOf(o[key]));
+        };
       }
       case 'if': {
         const p = n.path;
@@ -1033,37 +1076,64 @@ export function buildJson(input) {
   const tagList = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // 7. layouts
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
+  // s.html, s.excerpt and each toc entry's html are JSON-escaped (renderMarkdown): a record keeps them under JSYM
+  // for the raw output, and reads them back as plain text only where a template asks for the value itself.
+  const cardOf = (s) => {
+    const ex = s.excerpt;
+    return {
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.data.date === undefined ? '' : longDate(s.data.date),
+      summary: s.data.summary ?? '',
+      get excerpt() {
+        return unJ(ex);
+      },
+      reading_minutes: Math.max(1, Math.ceil(wordsOf(s.body) / 200)),
+      tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      [JSYM]: { excerpt: ex },
+    };
+  };
   const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
+  const tocOf = (h) => {
+    const hj = h.html;
+    return {
+      level: h.level,
+      id: h.id,
+      get html() {
+        return unJ(hj);
+      },
+      [JSYM]: { html: hj },
+    };
+  };
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
   const pageOf = (s) => {
     const c = s.post ? cards.get(s) : cardOf(s);
+    const ex = s.excerpt;
+    const content = s.html;
     return {
       title: c.title,
       url: c.url,
       date: c.date,
       date_long: c.date_long,
       summary: c.summary,
-      excerpt: c.excerpt,
+      get excerpt() {
+        return unJ(ex);
+      },
       reading_minutes: c.reading_minutes,
       tags: s.post ? s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })) : c.tags,
       slug: s.slug,
-      content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+      get content() {
+        return unJ(content);
+      },
+      toc: s.toc.map(tocOf),
       newer: linkOf(s.newer ?? null),
       older: linkOf(s.older ?? null),
       is_post: s.post,
+      [JSYM]: { excerpt: ex, content },
     };
   };
+
   const fns = compileTemplates(parsed);
   const site = { title: input.site.title, base_url: base };
   const allTags = tagList.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));

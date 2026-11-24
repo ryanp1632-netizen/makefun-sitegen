@@ -5,6 +5,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
 setFlagsFromString('--no-incremental-marking');
+setFlagsFromString('--max-semi-space-size=32');
 
 const { buildJson } = (await import(new URL('./solve.js', import.meta.url).href)) as { buildJson: (input: unknown) => string };
 
